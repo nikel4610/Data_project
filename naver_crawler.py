@@ -22,10 +22,11 @@ NAVER_MAP_URL = "https://map.naver.com/p/entry/place/37126807?c=15.00,0,0,0,dh&p
 
 START_DATE = datetime(2024, 1, 1)
 
-# 수집 제어
 SLEEP = 1.2
-MAX_IDLE_ROUNDS = 8         # 새 리뷰가 안 늘어나는 라운드가 이 횟수 이상이면 종료
-SAFETY_MAX_ROUNDS = 300     # 무한루프 방지용
+MAX_IDLE_ROUNDS = 8
+SAFETY_MAX_ROUNDS = 300
+REVIEW_LIMIT = 50
+
 OUTPUT_CSV = "naver_reviews.csv"
 TEMP_CSV = "naver_reviews_temp.csv"
 
@@ -58,13 +59,6 @@ def safe_text(parent, by, selector, default=""):
         return default
 
 
-def safe_texts(parent, by, selector):
-    try:
-        return [e.text.strip() for e in parent.find_elements(by, selector) if e.text.strip()]
-    except Exception:
-        return []
-
-
 def exists(parent, by, selector):
     try:
         parent.find_element(by, selector)
@@ -78,12 +72,6 @@ def normalize_date_string(y, m, d):
 
 
 def extract_visit_date_from_text(text):
-    """
-    카드 전체 텍스트에서 방문 날짜 추출
-    우선순위:
-    1) YYYY.MM.DD
-    2) YYYY년 M월 D일
-    """
     m1 = re.search(r"(\d{4})\.(\d{1,2})\.(\d{1,2})", text)
     if m1:
         y, m, d = m1.groups()
@@ -124,9 +112,6 @@ def parse_visit_info_from_text(full_text):
 
 
 def extract_account_review_count(full_text):
-    """
-    예: '리뷰 106 사진 499 팔로워 1' -> 106
-    """
     match = re.search(r"리뷰\s*([\d,]+)", full_text)
     if match:
         return match.group(1).replace(",", "")
@@ -134,80 +119,14 @@ def extract_account_review_count(full_text):
 
 
 def count_review_chars(review_text):
-    return len(review_text)
+    return len(review_text or "")
 
 
-def extract_review_text(full_text):
-    """
-    카드 전체 텍스트에서 리뷰 본문 추출
-    구조가 조금씩 달라도 최대한 본문만 남기도록 처리
-    """
-    try:
-        lines = [line.strip() for line in full_text.split("\n") if line.strip()]
-        if not lines:
-            return ""
-
-        # 아래와 같은 UI/메타 영역이 나오기 전까지만 본문 후보로 사용
-        stop_tokens = {
-            "반응 남기기", "접기", "방문일", "인증 수단", "메뉴", "재방문", "영수증", "예약", "주문", "포장", "배달"
-        }
-
-        # 일반적으로 상단 2~3줄은 닉네임/리뷰수/팔로우 등
-        # 여기서는 너무 공격적으로 자르지 않고, 메타로 보이는 줄만 제외
-        filtered = []
-
-        for line in lines:
-            if line in stop_tokens:
-                break
-
-            # 상단 UI 제거
-            if line == "팔로우":
-                continue
-            if re.fullmatch(r"리뷰\s*[\d,]+.*", line):
-                continue
-            if re.fullmatch(r"사진\s*[\d,]+.*", line):
-                continue
-            if re.fullmatch(r"팔로워\s*[\d,]+.*", line):
-                continue
-
-            # 방문 상황/혼밥/대기시간 등 키워드성 메타 제거
-            meta_like_keywords = [
-                "방문", "이용", "대기 시간", "연인", "배우자", "친구", "가족",
-                "아이", "혼자", "점심", "저녁", "아침", "예약", "주문", "포장", "배달"
-            ]
-            if any(k in line for k in meta_like_keywords):
-                # 날짜 줄은 뒤에서 따로 처리하므로 제외
-                if re.search(r"\d{4}[.\년]\s*\d{1,2}[.\월]\s*\d{1,2}", line):
-                    continue
-
-            filtered.append(line)
-
-        # 첫 줄이 닉네임일 가능성이 높으면 제거
-        # 닉네임은 보통 짧고, 뒤에 본문이 이어짐
-        if filtered:
-            if len(filtered[0]) <= 20 and len(filtered) >= 2:
-                # 너무 짧고 문장 느낌이 약하면 닉네임으로 간주
-                if not re.search(r"[.!?]|[가-힣]{6,}", filtered[0]):
-                    filtered = filtered[1:]
-
-        review_text = " ".join(filtered).strip()
-
-        # 날짜/방문횟수/인증수단 같은 텍스트 제거
-        review_text = re.sub(r"\b\d{4}\.\d{1,2}\.\d{1,2}\b", " ", review_text)
-        review_text = re.sub(r"\b\d{4}년\s*\d{1,2}월\s*\d{1,2}일\b", " ", review_text)
-        review_text = re.sub(r"\b\d+번째 방문\b", " ", review_text)
-        review_text = re.sub(r"\b(영수증|예약|주문|포장|배달)\b", " ", review_text)
-
-        review_text = re.sub(r"\s+", " ", review_text).strip()
-
-        # 너무 짧은 UI 찌꺼기는 제거
-        if review_text in {"", "팔로우", "리뷰", "사진", "반응 남기기"}:
-            return ""
-
-        return review_text
-
-    except Exception:
-        return ""
+def preview_text(text, max_len=120):
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
 
 
 def make_review_key(row):
@@ -216,6 +135,39 @@ def make_review_key(row):
         row.get("방문 날짜", "").strip(),
         row.get("리뷰 내용", "").strip()
     )
+
+
+def extract_review_text_by_xpath(driver, idx):
+    """
+    //*[@id="_review_list"]/li[i]/div[5]/a[1]
+    에서 리뷰 텍스트를 가져오되,
+    <br> 태그는 공백으로 바꾼 뒤 순수 텍스트만 수집
+    """
+    xpath = f'//*[@id="_review_list"]/li[{idx}]/div[5]/a[1]'
+
+    try:
+        elem = driver.find_element(By.XPATH, xpath)
+
+        # HTML 원문 가져오기
+        html = elem.get_attribute("innerHTML") or ""
+
+        # <br>, <br/>, <br /> 전부 공백으로 치환
+        html = re.sub(r"<br\s*/?>", " ", html, flags=re.IGNORECASE)
+
+        # 나머지 HTML 태그 제거
+        text = re.sub(r"<[^>]+>", "", html)
+
+        # HTML 공백 문자 정리
+        text = text.replace("&nbsp;", " ")
+
+        # 줄바꿈/탭/중복공백 정리
+        text = re.sub(r"[\r\n\t]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    except Exception:
+        return ""
 
 
 # =====================================
@@ -266,9 +218,6 @@ def click_review_tab(driver):
 # 5. 리뷰 영역 찾기 / 스크롤
 # =====================================
 def get_review_scroll_box(driver):
-    """
-    네이버 지도 리뷰 리스트가 들어있는 실제 스크롤 박스를 최대한 유연하게 찾는다.
-    """
     candidates = [
         "div[role='main']",
         "div.place_section_content",
@@ -289,9 +238,6 @@ def get_review_scroll_box(driver):
 
 
 def click_more_buttons(driver):
-    """
-    리뷰 더보기 / 펼쳐서 더보기 버튼을 가능한 만큼 클릭
-    """
     xpaths = [
         "//a[contains(., '펼쳐서 더보기')]",
         "//button[contains(., '펼쳐서 더보기')]",
@@ -339,6 +285,7 @@ def scroll_once(driver):
 # =====================================
 def get_review_cards(driver):
     selectors = [
+        "#_review_list > li",
         "li.EjjAW",
         "li.place_apply_pui",
         "div[class*='place_apply_pui']",
@@ -354,18 +301,16 @@ def get_review_cards(driver):
     return []
 
 
-def parse_one_card(card):
+def parse_one_card(driver, card, idx):
     full_text = card.text.strip()
     if not full_text:
         return None
 
-    # 계정 ID
     account_id = safe_text(
         card, By.CSS_SELECTOR,
         ".pui__NMi-Dp, .pui__uslU0d, .place_bluelink, [class*='nick'], [class*='name']"
     )
 
-    # fallback: 첫 줄을 계정명 후보로 사용
     if not account_id:
         lines = [line.strip() for line in full_text.split("\n") if line.strip()]
         if lines:
@@ -377,13 +322,8 @@ def parse_one_card(card):
     if not visit_date or not is_valid_date(visit_date):
         return None
 
-    keywords = safe_texts(
-        card, By.CSS_SELECTOR,
-        ".pui__jhpEyP span, .keyword_tag, [class*='tag']"
-    )
-    keywords_joined = ", ".join(keywords)
-
-    review_text = extract_review_text(full_text)
+    # 핵심: 지정 XPath에서 리뷰 내용 직접 수집
+    review_text = extract_review_text_by_xpath(driver, idx)
     review_char_count = count_review_chars(review_text)
 
     has_photo = exists(
@@ -397,27 +337,28 @@ def parse_one_card(card):
         "방문 날짜": visit_date,
         "방문 횟수": visit_count,
         "인증 수단": auth_method,
-        "키워드": keywords_joined,
         "리뷰 내용": review_text,
         "리뷰 글자 수": review_char_count,
         "리뷰 내 사진 유무": has_photo
     }
 
-    # 리뷰 내용이 비어 있어도, 최소 메타는 남길 수 있게 허용
     if not row["계정 ID"] and not row["리뷰 내용"]:
         return None
 
     return row
 
 
-def collect_visible_reviews(driver, collected_dict):
+def collect_visible_reviews(driver, collected_dict, limit=REVIEW_LIMIT):
     cards = get_review_cards(driver)
     new_count = 0
     parsed_count = 0
 
     for idx, card in enumerate(cards, start=1):
+        if len(collected_dict) >= limit:
+            break
+
         try:
-            row = parse_one_card(card)
+            row = parse_one_card(driver, card, idx)
             if not row:
                 continue
 
@@ -427,6 +368,22 @@ def collect_visible_reviews(driver, collected_dict):
             if key not in collected_dict:
                 collected_dict[key] = row
                 new_count += 1
+
+                print("\n" + "=" * 70)
+                print(f"[PREVIEW] 수집 #{len(collected_dict)}")
+                print(f"계정 ID       : {row['계정 ID']}")
+                print(f"계정의 리뷰 수 : {row['계정의 리뷰 수']}")
+                print(f"방문 날짜      : {row['방문 날짜']}")
+                print(f"방문 횟수      : {row['방문 횟수']}")
+                print(f"인증 수단      : {row['인증 수단']}")
+                print(f"사진 유무      : {row['리뷰 내 사진 유무']}")
+                print(f"글자 수        : {row['리뷰 글자 수']}")
+                print(f"리뷰 내용      : {preview_text(row['리뷰 내용'], 120)}")
+                print("=" * 70)
+
+                if len(collected_dict) >= limit:
+                    print(f"[INFO] 목표 수집 개수 {limit}개 도달")
+                    break
 
         except Exception as e:
             print(f"[WARN] 카드 파싱 실패: {e}")
@@ -438,60 +395,65 @@ def collect_visible_reviews(driver, collected_dict):
 # =====================================
 # 7. 전체 수집 루프
 # =====================================
-def collect_all_reviews(driver):
+def collect_all_reviews(driver, limit=REVIEW_LIMIT):
     collected = {}
     idle_rounds = 0
 
     for round_idx in range(1, SAFETY_MAX_ROUNDS + 1):
+        if len(collected) >= limit:
+            print(f"[INFO] 목표 수집 개수 {limit}개 도달로 종료")
+            break
+
         print(f"\n[INFO] ===== 수집 라운드 {round_idx} =====")
 
-        # 현재 보이는 카드들 먼저 수집
         click_count = click_more_buttons(driver)
         if click_count:
             print(f"[INFO] 더보기 클릭 수: {click_count}")
 
-        new_count = collect_visible_reviews(driver, collected)
+        new_count = collect_visible_reviews(driver, collected, limit=limit)
 
-        if len(collected) > 0 and len(collected) % 50 == 0:
+        if len(collected) >= limit:
+            print(f"[INFO] 목표 수집 개수 {limit}개 도달로 종료")
+            break
+
+        if len(collected) > 0:
             pd.DataFrame(list(collected.values())).to_csv(
                 TEMP_CSV, index=False, encoding="utf-8-sig"
             )
-            print(f"[INFO] 중간 저장 완료: {len(collected)}개")
 
-        # 신규 수집이 없으면 idle 증가
         if new_count == 0:
             idle_rounds += 1
         else:
             idle_rounds = 0
 
-        # 스크롤
         before, after, height = scroll_once(driver)
         print(f"[INFO] scrollTop: {before} -> {after} / scrollHeight={height}")
 
-        # 다시 보이는 카드 수집
         click_count_2 = click_more_buttons(driver)
         if click_count_2:
             print(f"[INFO] 스크롤 후 더보기 클릭 수: {click_count_2}")
 
-        new_count_after_scroll = collect_visible_reviews(driver, collected)
+        new_count_after_scroll = collect_visible_reviews(driver, collected, limit=limit)
+
+        if len(collected) >= limit:
+            print(f"[INFO] 목표 수집 개수 {limit}개 도달로 종료")
+            break
 
         if new_count_after_scroll == 0:
             idle_rounds += 1
         else:
             idle_rounds = 0
 
-        if len(collected) > 0 and len(collected) % 50 == 0:
+        if len(collected) > 0:
             pd.DataFrame(list(collected.values())).to_csv(
                 TEMP_CSV, index=False, encoding="utf-8-sig"
             )
-            print(f"[INFO] 중간 저장 완료: {len(collected)}개")
 
-        # 종료 조건
         if idle_rounds >= MAX_IDLE_ROUNDS:
             print("[INFO] 새 리뷰가 더 이상 늘지 않아 수집 종료")
             break
 
-    return list(collected.values())
+    return list(collected.values())[:limit]
 
 
 # =====================================
@@ -508,7 +470,7 @@ def main():
         switch_to_entry_iframe(driver)
         click_review_tab(driver)
 
-        data = collect_all_reviews(driver)
+        data = collect_all_reviews(driver, limit=REVIEW_LIMIT)
         print(f"[INFO] 총 수집된 리뷰 수(중복 제거 전): {len(data)}")
 
         df = pd.DataFrame(data)
@@ -517,7 +479,10 @@ def main():
             df = df.drop_duplicates(
                 subset=["계정 ID", "방문 날짜", "리뷰 내용"],
                 keep="first"
-            ).sort_values(by=["방문 날짜", "계정 ID"], ascending=[False, True])
+            ).sort_values(
+                by=["방문 날짜", "계정 ID"],
+                ascending=[False, True]
+            ).head(REVIEW_LIMIT)
 
         df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
         print(f"[DONE] 최종 저장 완료: {len(df)}개 -> {OUTPUT_CSV}")
