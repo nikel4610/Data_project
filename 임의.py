@@ -1,3 +1,5 @@
+# 네이버 크롤링 (2024.01.01~)
+
 import re
 import time
 import pandas as pd
@@ -20,7 +22,7 @@ from selenium.common.exceptions import TimeoutException
 # =====================================
 NAVER_MAP_URL = "https://map.naver.com/p/search/%EC%98%A4%EC%9D%B4%EC%A7%80/place/1791259060?c=15.00,0,0,0,dh&placePath=/review?bk_query=%EC%98%A4%EC%9D%B4%EC%A7%80&entry=bmp&fromPanelNum=2&locale=ko&searchText=%EC%98%A4%EC%9D%B4%EC%A7%80&svcName=map_pcv5&timestamp=202604091934&entry=bmp&fromPanelNum=2&timestamp=202604091934&locale=ko&svcName=map_pcv5&searchText=%EC%98%A4%EC%9D%B4%EC%A7%80&from=map"
 
-# START_DATE = datetime(2025, 1, 1)
+START_DATE = datetime(2000, 1, 1)
 
 SLEEP = 1.2
 MAX_IDLE_ROUNDS = 8
@@ -85,7 +87,7 @@ def extract_visit_date_from_text(text):
     return ""
 
 
-# def is_valid_date(date_str):
+def is_valid_date(date_str):
     try:
         date_obj = datetime.strptime(date_str, "%Y.%m.%d")
         return date_obj >= START_DATE
