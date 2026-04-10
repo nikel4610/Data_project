@@ -16,8 +16,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-URL = "https://place.map.kakao.com/1567468475#comment"
-TARGET_COUNT = 10
+URL = "https://place.map.kakao.com/27306859#review"
+TARGET_COUNT = 50
 OUTPUT_CSV = f"reviews_{int(time.time())}.csv"
 
 DEFAULT_WAIT_SECONDS = 5
@@ -107,31 +107,46 @@ def parse_date(text: str) -> str:
     return ""
 
 
-def click_review_tab(driver: webdriver.Chrome) -> bool:
-    return click_first_matching(
-        driver,
-        [
-            "//a[contains(@href, '#comment')]",
-            "//a[contains(@href, '#review')]",
-            "//a[contains(., '리뷰')]",
-            "//button[contains(., '리뷰')]",
-        ],
-        "[OK] 리뷰 탭 클릭 성공",
-        "[WARN] 리뷰 탭 클릭 실패",
-    )
+# def click_review_tab(driver: webdriver.Chrome) -> bool:
+#     return click_first_matching(
+#         driver,
+#         [
+#             "//a[contains(@href, '#comment')]",
+#             "//a[contains(@href, '#review')]",
+#             "//a[contains(., '리뷰')]",
+#             "//button[contains(., '리뷰')]",
+#         ],
+#         "[OK] 리뷰 탭 클릭 성공",
+#         "[WARN] 리뷰 탭 클릭 실패",
+#     )
 
 
-def click_latest_sort(driver: webdriver.Chrome) -> bool:
-    return click_first_matching(
-        driver,
-        [
-            "//*[self::a or self::button][contains(., '최신순')]",
-            "//*[contains(., '최신순')]",
-        ],
-        "[OK] 최신순 클릭 성공",
-        "[WARN] 최신순 클릭 실패",
-    )
+def click_latest_sort(driver):
+    """
+    카카오맵 정렬 구조:
+      .btn_sort 클릭 → .layer_sort 드롭다운 열림 (display:none → block)
+      → .link_sort 중 '최신 순' 클릭
+    """
+    try:
+        btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn_sort"))
+        )
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(0.5)
 
+        links = driver.find_elements(By.CSS_SELECTOR, ".link_sort")
+        for link in links:
+            if "최신" in link.text:
+                driver.execute_script("arguments[0].click();", link)
+                print("[최신순] 정렬 클릭 성공")
+                time.sleep(1.0)
+                return True
+
+    except Exception as e:
+        print(f"[DEBUG] click_latest_sort 예외: {e}")
+
+    print("[WARN] 최신순 정렬 클릭 실패 - 기본 정렬로 진행")
+    return False
 
 def is_valid_review_card(card: WebElement) -> bool:
     text = get_text(card)
@@ -395,9 +410,9 @@ def crawl_reviews() -> pd.DataFrame:
         driver.get(URL)
         time.sleep(PAGE_LOAD_SLEEP)
 
-        review_tab_ok = click_review_tab(driver)
+        # review_tab_ok = click_review_tab(driver)
         latest_sort_ok = click_latest_sort(driver)
-        print(f"[INFO] review_tab_ok={review_tab_ok}, latest_sort_ok={latest_sort_ok}")
+        print(f"latest_sort_ok={latest_sort_ok}")
 
         collected_dict = {}
         no_new_rounds = 0
