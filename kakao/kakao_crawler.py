@@ -1,154 +1,110 @@
 import re
 import time
-import pandas as pd
+from typing import List, Optional, Sequence
 
+import pandas as pd
 from selenium import webdriver
+from selenium.common.exceptions import (
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
-
-from config import (
-    SLEEP, MAX_IDLE_ROUNDS, SAFETY_MAX_ROUNDS,
-    TEMP_CSV, START_DATE
-)
+from selenium.webdriver.support.ui import WebDriverWait
 
 
-# =====================================
-# 드라이버 생성
-# =====================================
-def create_driver():
+URL = "https://place.map.kakao.com/27306859#review" # 나중에 가게 ID를 변수로 바꿔서 여러 가게 크롤링할 수 있게 개선 가능
+TARGET_COUNT = 50 # 수집할 리뷰 개수 (None이면 가능한 최대한 많이 수집) -> 년도를 기준으로 수집하도록 수정해야 함
+OUTPUT_CSV = f"reviews_{int(time.time())}.csv"
+
+DEFAULT_WAIT_SECONDS = 5
+PAGE_LOAD_SLEEP = 3.0
+CLICK_SLEEP = 1.0
+
+
+def create_driver() -> webdriver.Chrome:
     options = Options()
     options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
     options.add_argument("--lang=ko-KR")
-
     driver = webdriver.Chrome(options=options)
     driver.implicitly_wait(2)
     return driver
 
 
-# =====================================
-# 보조 함수
-# =====================================
-def clean_text(text):
+def normalize_whitespace(text: str) -> str:
     if not text:
         return ""
-    text = text.replace("\n", " ").replace("\t", " ").replace("\r", " ")
-    text = text.replace("<br>", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text.replace("\n", " ").replace("\t", " ").replace("\r", " ")).strip()
 
 
-def safe_text(elem):
+def preview_text(text: str, limit: int = 120) -> str:
+    text = normalize_whitespace(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def get_text(element: WebElement) -> str:
     try:
-        return clean_text(elem.text)
-    except Exception:
+        return normalize_whitespace(element.text)
+    except (StaleElementReferenceException, WebDriverException):
         return ""
 
 
-def parse_date(text):
-    if not text:
-        return ""
+def find_first_clickable(
+    driver: webdriver.Chrome,
+    xpaths: Sequence[str],
+    timeout: int = DEFAULT_WAIT_SECONDS,
+) -> Optional[WebElement]:
+    wait = WebDriverWait(driver, timeout)
+    for xpath in xpaths:
+        try:
+            return wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+        except TimeoutException:
+            continue
+    return None
+
+
+def click_first_matching(
+    driver: webdriver.Chrome,
+    xpaths: Sequence[str],
+    success_message: str,
+    fail_message: str,
+) -> bool:
+    element = find_first_clickable(driver, xpaths)
+    if element is None:
+        print(fail_message)
+        return False
+
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        print(success_message)
+        time.sleep(CLICK_SLEEP)
+        return True
+    except WebDriverException as exc:
+        print(f"{fail_message} ({exc})")
+        return False
+
+
+def parse_date(text: str) -> str:
     patterns = [
         r"(\d{4}-\d{1,2}-\d{1,2})",
         r"(\d{4}\.\d{1,2}\.\d{1,2})",
         r"(\d{4}/\d{1,2}/\d{1,2})",
         r"(\d{4}년\s*\d{1,2}월\s*\d{1,2}일)",
     ]
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            d = m.group(1)
-            if "년" in d:
-                d = d.replace("년", "-").replace("월", "-").replace("일", "")
-                d = re.sub(r"\s+", "", d)
-            return d.replace(".", "-").replace("/", "-")
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            value = match.group(1)
+            if "년" in value:
+                value = value.replace("년", "-").replace("월", "-").replace("일", "")
+                value = re.sub(r"\s+", "", value)
+            return value.replace(".", "-").replace("/", "-")
     return ""
-
-
-def check_date_range(date_str):
-    if not date_str:
-        return "error"
-    try:
-        from datetime import datetime
-        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-        return "valid" if date_obj >= START_DATE else "old"
-    except Exception:
-        return "error"
-
-
-def make_review_key(row):
-    return (
-        row.get("계정 ID", "").strip(),
-        row.get("방문 날짜", "").strip(),
-        row.get("리뷰 내용", "").strip()
-    )
-
-
-# =====================================
-# 식당 이름 수집
-# =====================================
-def get_place_name(driver):
-    for selector in ["h3.tit_place", "h2.tit_place", "h1.tit_place", "[class*='tit_place']"]:
-        try:
-            name = driver.find_element(By.CSS_SELECTOR, selector).text.strip()
-            if name:
-                print(f"[INFO] 식당 이름 수집: {name}")
-                return name
-        except Exception:
-            continue
-    print("[WARN] 식당 이름을 찾지 못했습니다.")
-    return ""
-
-
-# =====================================
-# 리뷰 탭 / 최신순 정렬
-# =====================================
-def click_review_tab(driver):
-    # 카카오맵 실제 구조: <a href="#review" role="tab">후기</a>
-    for by, sel in [
-        (By.CSS_SELECTOR, "a[href='#review']"),
-        (By.XPATH, "//a[@href='#review']"),
-        (By.XPATH, "//a[contains(@href,'#review')]"),
-    ]:
-        try:
-            elem = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((by, sel))
-            )
-            driver.execute_script("arguments[0].click();", elem)
-            print("[리뷰 탭] 클릭 성공")
-            time.sleep(1.5)
-            return True
-        except Exception:
-            pass
-    print("[WARN] 리뷰 탭 클릭 실패")
-    return False
-
-
-def click_load_more_reviews(driver):
-    """
-    '후기 더보기' 버튼이 있을 때만 클릭.
-    버튼이 없으면 조용히 넘어감 (스크롤로 자동 로드되는 경우엔 뜨지 않음).
-    """
-    for by, sel in [
-        (By.XPATH, '//*[@id="mainContent"]/div[2]/div[2]/div[8]/div[3]/a'),  # 실제 XPath
-        (By.XPATH, "//a[contains(., '후기 더보기')]"),
-        (By.XPATH, "//a[contains(., '리뷰 더보기')]"),
-    ]:
-        try:
-            btn = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((by, sel))
-            )
-            driver.execute_script("arguments[0].click();", btn)
-            print("[후기 더보기] 버튼 클릭 성공")
-            time.sleep(1.5)
-            return True
-        except Exception:
-            pass
-    return False  # 버튼 없으면 정상 (스크롤 방식)
 
 
 def click_latest_sort(driver):
@@ -179,253 +135,295 @@ def click_latest_sort(driver):
     return False
 
 
-# =====================================
-# 리뷰 카드 수집
-# =====================================
-def get_review_cards(driver):
-    # 카카오맵 실제 구조: ul.list_review > li
-    try:
-        elems = driver.find_elements(By.CSS_SELECTOR, "ul.list_review > li")
-        if elems:
-            return elems
-    except Exception:
-        pass
-    try:
-        return driver.find_elements(By.CSS_SELECTOR, "ul[class*='review'] > li")
-    except Exception:
-        return []
+def is_valid_review_card(card: WebElement) -> bool:
+    text = get_text(card)
+    return bool(text) and bool(parse_date(text))
 
 
-def scroll_once(driver):
-    before = driver.execute_script("return window.scrollY;")
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(SLEEP)
-    after = driver.execute_script("return window.scrollY;")
-    return before, after
+def get_review_cards(driver: webdriver.Chrome) -> List[WebElement]:
+    selectors: Sequence[tuple] = [
+        (By.CSS_SELECTOR, "[data-review-item]"),
+        (By.CSS_SELECTOR, "li"),
+        (By.CSS_SELECTOR, "article"),
+    ]
 
+    best_cards: List[WebElement] = []
 
-# =====================================
-# 카드 파싱
-# =====================================
-def expand_review_text(card, driver):
-    """더보기 버튼 클릭. 카카오맵 실제 구조: <a class='link_review'>...더보기</a>"""
-    try:
-        btn = card.find_element(By.CSS_SELECTOR, "a.link_review")
-        if "더보기" in btn.text:
-            driver.execute_script("arguments[0].click();", btn)
-            time.sleep(0.15)
-    except Exception:
-        pass
-
-
-def extract_account_id(card):
-    # 카카오맵: <span class="name_user"><span class="screen_out">리뷰어 이름, </span>닉네임</span>
-    try:
-        name_elem = card.find_element(By.CSS_SELECTOR, ".name_user")
-        lines = [l.strip() for l in name_elem.text.split("\n") if l.strip()]
-        for line in reversed(lines):
-            if line and "리뷰어 이름" not in line:
-                return line
-    except Exception:
-        pass
-    return ""
-
-
-def extract_review_text(card):
-    # 카카오맵: <p class="desc_review"> 또는 <a class="link_review">
-    for selector in ["p.desc_review", "a.link_review"]:
+    for by, selector in selectors:
         try:
-            elem = card.find_element(By.CSS_SELECTOR, selector)
-            t = clean_text(elem.text)
-            t = re.sub(r"\s*\.{3}\s*더보기\s*$", "", t).strip()
-            if t and len(t) >= 5:
-                return t
-        except Exception:
-            pass
-    return ""
+            elements = driver.find_elements(by, selector)
+            filtered = [element for element in elements if is_valid_review_card(element)]
+            print(f"[DEBUG] selector={selector}, raw={len(elements)}, valid={len(filtered)}")
+
+            if len(filtered) > len(best_cards):
+                best_cards = filtered
+        except WebDriverException as exc:
+            print(f"[WARN] selector 실패: {selector} ({exc})")
+
+    return best_cards
 
 
-def extract_star(card):
-    # 카카오맵: <span class="starred_grade">별점\n3.0</span>
+def make_review_key(row: dict) -> tuple:
+    return (
+        row.get("계정 ID", ""),
+        row.get("방문 날짜", ""),
+        row.get("리뷰 내용", ""),
+    )
+
+
+def expand_more_in_card(driver: webdriver.Chrome, card: WebElement) -> None:
+    """
+    카드 내 .btn_more span을 execute_script .click()으로 클릭해 리뷰 전문을 펼친다.
+    - .btn_more.click() → 텍스트 펼쳐짐, URL 변경 없음 (정상)
+    - .link_review 클릭 → URL이 #review → # 으로 이동해버림 (사용 금지)
+    - dispatchEvent(click) → 동작 안 함 (사용 금지)
+    """
     try:
-        txt = card.find_element(By.CSS_SELECTOR, ".starred_grade").text
-        m = re.search(r"([0-5](?:\.\d+)?)", txt)
-        return m.group(1) if m else ""
-    except Exception:
+        btn_more = card.find_element(By.CSS_SELECTOR, ".btn_more")
+        driver.execute_script("arguments[0].click();", btn_more)
+        time.sleep(0.3)
+    except (WebDriverException, Exception):
+        pass  # btn_more 없으면 이미 전문 상태 — 그냥 통과
+
+
+def get_css_text(card: WebElement, selector: str) -> str:
+    """card 내에서 CSS selector로 첫 번째 요소의 텍스트를 반환"""
+    try:
+        return normalize_whitespace(card.find_element(By.CSS_SELECTOR, selector).text)
+    except (WebDriverException, Exception):
         return ""
 
 
-def extract_level(card):
-    # 카카오맵: <span class="ico_badge ico_badge_blue">블루 레벨</span>
-    try:
-        txt = card.find_element(By.CSS_SELECTOR, "[class*='ico_badge']").text.strip()
-        return txt if txt else ""
-    except Exception:
-        return ""
+def parse_one_card(driver: webdriver.Chrome, card: WebElement, idx: int) -> Optional[dict]:
+    # ── 0. 더보기 펼치기 (.link_review 클릭) ────────────────────────────
+    expand_more_in_card(driver, card)
 
+    # ── 1. CSS 클래스로 각 필드 직접 추출 ───────────────────────────────
 
-def extract_detail_info(card):
-    """계정의 후기수, 별점평균. 카카오맵: <ul class="list_detail"><li>후기 N</li><li>별점평균 X.X</li>"""
-    review_count, avg_star = "", ""
+    # 닉네임: .name_user 내 .screen_out("리뷰어 이름," 텍스트) 제거 후 추출
+    account_id = ""
     try:
-        items = card.find_elements(By.CSS_SELECTOR, ".list_detail li")
-        for item in items:
-            t = item.text.strip()
-            if "후기" in t:
-                m = re.search(r"후기\s*(\d+)", t)
-                if m:
-                    review_count = m.group(1)
-            elif "별점평균" in t:
-                m = re.search(r"별점평균\s*([0-5](?:\.\d+)?)", t)
-                if m:
-                    avg_star = m.group(1)
-    except Exception:
+        name_el = card.find_element(By.CSS_SELECTOR, ".name_user")
+        account_id = driver.execute_script(
+            """
+            const el = arguments[0].cloneNode(true);
+            el.querySelectorAll('.screen_out').forEach(s => s.remove());
+            return el.innerText.trim();
+            """,
+            name_el,
+        )
+    except (WebDriverException, Exception):
         pass
-    return review_count, avg_star
 
+    # 레벨: .ico_badge
+    user_level = get_css_text(card, ".ico_badge")
 
-def parse_one_card(card, driver, place_name=""):
-    """
-    카카오 리뷰 카드 1개를 파싱합니다.
-    반환값:
-        dict   - 정상 파싱된 리뷰 데이터
-        "stop" - START_DATE 이전 리뷰 (수집 중단 신호)
-        None   - 스킵
-    """
-    # 날짜 먼저 확인 (빠른 early exit) - safe_text(card) 전체 파싱 불필요
+    # 리뷰 수: 후기 li (list_detail 첫 번째 li)
+    account_review_count = ""
+    raw_review_count = get_css_text(card, ".list_detail li:first-child")
+    if raw_review_count:
+        m = re.search(r"(\d+)", raw_review_count)
+        if m:
+            account_review_count = m.group(1)
+
+    # 날짜: .txt_date
+    visit_date = ""
+    raw_date = get_css_text(card, ".txt_date")
+    if raw_date:
+        visit_date = parse_date(raw_date)
+
+    # 별점: .starred_grade 내 두 번째 .screen_out (CSS hidden이라 JS로 추출)
+    rating = ""
     try:
-        date_text = card.find_element(By.CSS_SELECTOR, ".txt_date").text.strip()
-    except Exception:
-        date_text = ""
+        sg_el = card.find_element(By.CSS_SELECTOR, ".starred_grade")
+        rating = driver.execute_script(
+            """
+            const spans = arguments[0].querySelectorAll('.screen_out');
+            return spans.length >= 2 ? spans[1].innerText.trim() : '';
+            """,
+            sg_el,
+        )
+    except (WebDriverException, Exception):
+        pass
 
-    visit_date = parse_date(date_text)
-    date_status = check_date_range(visit_date)
+    # 리뷰 본문: .desc_review (더보기 펼친 후의 전문)
+    review_text = ""
+    try:
+        desc_el = card.find_element(By.CSS_SELECTOR, ".desc_review")
+        # .btn_more("더보기"), .btn_fold("접기") span 텍스트 제거 후 추출
+        review_text = driver.execute_script(
+            """
+            const el = arguments[0].cloneNode(true);
+            el.querySelectorAll('.btn_more, .btn_fold').forEach(s => s.remove());
+            return el.innerText.trim();
+            """,
+            desc_el,
+        )
+        review_text = normalize_whitespace(review_text)
+    except (WebDriverException, Exception):
+        pass
 
-    if date_status == "old":
-        return "stop"
-    if date_status == "error":
-        return None
-
-    # 더보기 펼치기
-    expand_review_text(card, driver)
-
-    # 리뷰 텍스트
-    review_text = extract_review_text(card)
+    # ── 2. 텍스트 리뷰 없는 카드 제외 (별점만 남긴 유저) ────────────────
     if not review_text:
         return None
 
-    # 사진 유무 (프로필 이미지 제외)
-    has_photo = 1 if card.find_elements(By.CSS_SELECTOR, ".list_photo img, .area_photo img") else 0
+    # ── 3. 사진 유무: .review_thumb 또는 .list_photo 존재 여부 ───────────
+    has_photo = False
+    try:
+        card.find_element(By.CSS_SELECTOR, ".review_thumb")
+        has_photo = True
+    except (WebDriverException, Exception):
+        has_photo = False
 
-    review_count, avg_star = extract_detail_info(card)
+    review_char_count = len(review_text)
 
     row = {
-        "식당 이름":            place_name,
-        "계정 ID":             extract_account_id(card),
-        "리뷰 다는 사람 레벨":   extract_level(card),
-        "방문 날짜":            visit_date,
-        "리뷰 내용":            review_text,
-        "리뷰 글자 수":         len(review_text),
-        "리뷰 내 사진 유무":     has_photo,
-        "별점":                extract_star(card),
-        "계정의 별점 평균":      avg_star,
-        "계정의 리뷰 수":       review_count,
+        "계정 ID": account_id,
+        "계정의 리뷰 수": account_review_count,
+        "방문 날짜": visit_date,
+        "별점": rating,
+        "리뷰 내 사진 유무": has_photo,
+        "리뷰 글자 수": review_char_count,
+        "리뷰 내용": review_text,
+        "카카오맵 리뷰다는 사람 레벨": user_level,
     }
+
     return row
 
 
-# =====================================
-# 전체 수집 루프
-# =====================================
-def check_and_click_load_more(driver):
-    """
-    '후기 더보기' 버튼이 화면에 있으면 클릭하고 True 반환.
-    버튼 클릭 후 페이지가 초기화되므로 수집 루프를 리셋해야 함.
-    """
-    for by, sel in [
-        (By.XPATH, '//*[@id="mainContent"]/div[2]/div[2]/div[8]/div[3]/a'),
-        (By.XPATH, "//a[contains(., '후기 더보기')]"),
-        (By.XPATH, "//a[contains(., '리뷰 더보기')]"),
-    ]:
+def collect_visible_reviews(driver, collected_dict, limit=TARGET_COUNT):
+    cards = get_review_cards(driver)
+    new_count = 0
+    parsed_count = 0
+
+    for idx, card in enumerate(cards, start=1):
+        if limit is not None and len(collected_dict) >= limit:
+            break
+
         try:
-            btn = driver.find_element(by, sel)
-            if btn.is_displayed():
-                driver.execute_script("arguments[0].click();", btn)
-                print("[후기 더보기] 버튼 클릭 → 페이지 재로드 대기")
-                time.sleep(2.5)  # 페이지 재로드 대기
-                return True
-        except Exception:
-            pass
+            row = parse_one_card(driver, card, idx)
+            if not row:
+                continue
+
+            parsed_count += 1
+            key = make_review_key(row)
+
+            if key not in collected_dict:
+                collected_dict[key] = row
+                new_count += 1
+
+                print("\n" + "=" * 70)
+                print(f"[PREVIEW] 수집 #{len(collected_dict)}")
+                print(f"계정 ID       : {row['계정 ID']}")
+                print(f"계정의 리뷰 수 : {row['계정의 리뷰 수']}")
+                print(f"방문 날짜      : {row['방문 날짜']}")
+                print(f"별점           : {row['별점']}")
+                print(f"사진 유무      : {row['리뷰 내 사진 유무']}")
+                print(f"글자 수        : {row['리뷰 글자 수']}")
+                print(f"리뷰 내용      : {preview_text(row['리뷰 내용'], 120)}")
+                print("=" * 70)
+
+                if limit is not None and len(collected_dict) >= limit:
+                    print(f"[INFO] 목표 수집 개수 {limit}개 도달")
+                    break
+
+        except Exception as e:
+            print(f"[WARN] 카드 파싱 실패: {e}")
+
+    print(
+        f"[INFO] 현재 화면 파싱 성공: {parsed_count}개 / "
+        f"신규 누적: {new_count}개 / 총 누적: {len(collected_dict)}개"
+    )
+    return new_count
+
+
+def try_click_more_button(driver: webdriver.Chrome) -> bool:
+    xpaths = [
+        "//*[self::a or self::button][contains(., '더보기')]",
+        "//*[self::a or self::button][contains(., '후기 더보기')]",
+        "//*[self::a or self::button][contains(., '리뷰 더보기')]",
+    ]
+
+    for xpath in xpaths:
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            for el in elements:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].click();", el)
+                    print("[OK] 더보기 클릭")
+                    time.sleep(1.5)
+                    return True
+        except WebDriverException:
+            continue
+
+    print("[WARN] 더보기 버튼 못 찾음")
     return False
 
 
-def collect_all_reviews(driver, place_name=""):
-    collected = {}
-    idle_rounds = 0
-    more_clicked = False  # 후기 더보기 버튼 클릭 여부
+def scroll_down(driver: webdriver.Chrome) -> None:
+    """단계적으로 스크롤을 내려 무한스크롤 트리거"""
+    try:
+        current_height = driver.execute_script("return document.body.scrollHeight")
+        step = current_height // 4
+        for i in range(1, 5):
+            driver.execute_script(f"window.scrollTo(0, {step * i});")
+            time.sleep(0.4)
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        print("[INFO] 단계적 스크롤 완료")
+        time.sleep(3.0)
+    except WebDriverException as e:
+        print(f"[WARN] 스크롤 실패: {e}")
 
-    for round_idx in range(1, SAFETY_MAX_ROUNDS + 1):
-        print(f"\n[===== 라운드 {round_idx} =====]")
 
-        # 후기 더보기 버튼 감지: 클릭하면 페이지 초기화되므로 idle 리셋 후 재시작
-        if not more_clicked:
-            if check_and_click_load_more(driver):
-                more_clicked = True
-                idle_rounds = 0
-                print("[INFO] 후기 더보기 클릭 완료 → 스크롤부터 재시작")
-                before, after = scroll_once(driver)
-                print(f"[INFO] 재시작 스크롤: {before} → {after}")
-                continue  # 카드 수집은 다음 라운드부터
+def crawl_reviews() -> pd.DataFrame:
+    driver = create_driver()
 
-        cards = get_review_cards(driver)
-        new_count = 0
-        should_stop = False
+    try:
+        print("[STEP] open site")
+        driver.get(URL)
+        time.sleep(PAGE_LOAD_SLEEP)
 
-        for card in cards:
-            try:
-                result = parse_one_card(card, driver, place_name)
+        latest_sort_ok = click_latest_sort(driver)
+        print(f"latest_sort_ok={latest_sort_ok}")
 
-                if result == "stop":
-                    print("[INFO] START_DATE 이전 리뷰 발견 → 수집 중단")
-                    should_stop = True
-                    break
+        collected_dict = {}
+        no_new_rounds = 0
+        max_rounds = 30
 
-                if result is None:
-                    continue
+        for round_idx in range(1, max_rounds + 1):
+            print(f"\n[STEP] load round {round_idx}/{max_rounds}")
 
-                key = make_review_key(result)
-                if key not in collected:
-                    collected[key] = result
-                    new_count += 1
-                    print(
-                        f"[수집 #{len(collected)}] {result['계정 ID']} | "
-                        f"{result['방문 날짜']} | 별점:{result['별점']} | "
-                        f"{result['리뷰 내용'][:60]}"
-                    )
+            new_count = collect_visible_reviews(driver, collected_dict, limit=TARGET_COUNT)
 
-            except Exception as e:
-                print(f"[WARN] 카드 파싱 실패: {e}")
+            if TARGET_COUNT is not None and len(collected_dict) >= TARGET_COUNT:
+                print(f"[INFO] 목표 수집 개수 {TARGET_COUNT}개 도달로 종료")
+                break
 
-        print(f"[INFO] 신규 {new_count}개 / 누적 {len(collected)}개")
+            clicked = try_click_more_button(driver)
+            scroll_down(driver)  # 더보기 클릭 성공 여부와 무관하게 항상 스크롤
 
-        if should_stop:
-            break
+            if new_count == 0:
+                no_new_rounds += 1
+            else:
+                no_new_rounds = 0
 
-        if collected:
-            pd.DataFrame(list(collected.values())).to_csv(
-                TEMP_CSV, index=False, encoding="utf-8-sig"
-            )
+            if no_new_rounds >= 3:
+                print("[INFO] 더 이상 신규 리뷰가 없어 종료")
+                break
 
-        idle_rounds = 0 if new_count > 0 else idle_rounds + 1
+        rows = list(collected_dict.values())
+        df = pd.DataFrame(rows)
+        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
-        if idle_rounds >= MAX_IDLE_ROUNDS:
-            print("[INFO] 신규 리뷰 없음 → 수집 종료")
-            break
+        print(f"[INFO] 총 수집된 리뷰 수: {len(df)}")
+        print(f"[DONE] 저장 완료: {OUTPUT_CSV}")
+        print(df.head(10))
 
-        before, after = scroll_once(driver)
-        print(f"[INFO] scrollY: {before} → {after}")
+        return df
 
-        if before == after:
-            idle_rounds += 1
+    finally:
+        driver.quit()
 
-    return list(collected.values())
+
+if __name__ == "__main__":
+    crawl_reviews()

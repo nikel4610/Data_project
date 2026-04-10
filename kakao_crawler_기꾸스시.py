@@ -383,7 +383,7 @@ def try_click_more_button(driver: webdriver.Chrome) -> bool:
     xpaths = [
         "//*[self::a or self::button][contains(., '더보기')]",
         "//*[self::a or self::button][contains(., '후기 더보기')]",
-        "//*[self::a or self::button][contains(., '리뷰 더보기')]",
+        # "//*[self::a or self::button][contains(., '리뷰 더보기')]",
     ]
 
     for xpath in xpaths:

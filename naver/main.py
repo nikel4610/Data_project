@@ -4,7 +4,8 @@ import pandas as pd
 from config import NAVER_MAP_URL, OUTPUT_CSV
 from crawler import create_driver, switch_to_entry_iframe, click_review_tab, collect_all_reviews
 
-
+# 네이버 지도 리뷰 크롤러 메인 함수
+# 이 파일을 실행해야 함
 def main():
     driver = create_driver()
 
