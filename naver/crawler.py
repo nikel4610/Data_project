@@ -14,7 +14,7 @@ from selenium.common.exceptions import TimeoutException
 
 from config import (
     SLEEP, MAX_IDLE_ROUNDS, SAFETY_MAX_ROUNDS,
-    TEMP_CSV, START_DATE
+    TEMP_CSV, START_DATE, MAX_REVIEWS
 )
 
 
@@ -315,6 +315,13 @@ def parse_one_card(driver, card, idx, place_name=""):
     return row
 
 
+def is_review_limit_reached(collected_dict):
+    """MAX_REVIEWS 제한에 도달했는지 확인합니다."""
+    if not MAX_REVIEWS:
+        return False
+    return len(collected_dict) >= MAX_REVIEWS
+
+
 def collect_visible_reviews(driver, collected_dict, place_name=""):
     """
     현재 화면에 보이는 리뷰 카드를 수집합니다.
@@ -325,6 +332,12 @@ def collect_visible_reviews(driver, collected_dict, place_name=""):
     should_stop = False
 
     for idx, card in enumerate(cards, start=1):
+        # MAX_REVIEWS 도달 시 즉시 중단
+        if is_review_limit_reached(collected_dict):
+            print(f"[INFO] 최대 수집 수({MAX_REVIEWS}개) 도달 → 수집 중단")
+            should_stop = True
+            break
+
         try:
             result = parse_one_card(driver, card, idx, place_name)
 
@@ -342,7 +355,11 @@ def collect_visible_reviews(driver, collected_dict, place_name=""):
                 new_count += 1
 
                 print("\n" + "=" * 70)
-                print(f"[수집 #{len(collected_dict)}]")
+                print(f"[수집 #{len(collected_dict)}]", end="")
+                if MAX_REVIEWS:
+                    print(f"  (최대 {MAX_REVIEWS}개 중)")
+                else:
+                    print()
                 print(f"계정 ID        : {result['계정 ID']}")
                 print(f"방문 날짜      : {result['방문 날짜']}")
                 print(f"인증 수단      : {result['인증 수단']}")
@@ -350,10 +367,20 @@ def collect_visible_reviews(driver, collected_dict, place_name=""):
                 print(f"리뷰 내용      : {preview_text(result['리뷰 내용'])}")
                 print("=" * 70)
 
+                # 추가 후 즉시 재확인
+                if is_review_limit_reached(collected_dict):
+                    print(f"[INFO] 최대 수집 수({MAX_REVIEWS}개) 도달 → 수집 중단")
+                    should_stop = True
+                    break
+
         except Exception as e:
             print(f"[WARN] 카드 파싱 실패: {e}")
 
-    print(f"[INFO] 신규 {new_count}개 / 누적 {len(collected_dict)}개")
+    print(f"[INFO] 신규 {new_count}개 / 누적 {len(collected_dict)}개", end="")
+    if MAX_REVIEWS:
+        print(f" / 목표 {MAX_REVIEWS}개")
+    else:
+        print()
     return new_count, should_stop
 
 
@@ -364,6 +391,9 @@ def collect_all_reviews(driver):
     place_name = get_place_name(driver)  # 식당 이름 먼저 수집
     collected = {}
     idle_rounds = 0
+
+    if MAX_REVIEWS:
+        print(f"[INFO] 최대 수집 수: {MAX_REVIEWS}개")
 
     for round_idx in range(1, SAFETY_MAX_ROUNDS + 1):
         print(f"\n[===== 라운드 {round_idx} =====]")
